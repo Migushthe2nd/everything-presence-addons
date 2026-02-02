@@ -18,6 +18,7 @@
 | [**Entry/Exit Detection**][in-out-detection]  | Track when people enter or leave specific areas
 | [**Heatmap Analytics**][heatmap-analytics]    | Visualize presence patterns over time
 | [**Recording**][trail-recording]              | Capture movement trails for analysis
+| **Automatic Zone Renaming**                   | Zone labels automatically sync to Home Assistant entity names
 | **Firmware Updates**                          | Update devices via a local proxy with progress tracking
 
 ## Supported Devices

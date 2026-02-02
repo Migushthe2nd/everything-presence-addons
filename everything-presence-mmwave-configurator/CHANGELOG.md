@@ -1,3 +1,7 @@
+## Unreleased
+### Features
+* Feature: Automatic zone entity renaming - Zone labels set in the configurator are now automatically synced to Home Assistant entity friendly names
+
 ## 2.0.12
 ## Features
 * Feature: Room builder - Add mid-segment wall insert and wall snap angle toggle by @EverythingSmartHome in https://github.com/EverythingSmartHome/everything-presence-addons/pull/256

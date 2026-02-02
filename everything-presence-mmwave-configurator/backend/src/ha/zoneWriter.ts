@@ -445,4 +445,94 @@ export class ZoneWriter {
 
     return { ok: failures.length === 0, failures };
   }
+
+  /**
+   * Sync zone labels to Home Assistant entity registry friendly names.
+   * Updates the friendly names of zone occupancy/presence binary sensors.
+   * Only syncs regular zones (Zone 1-4), not exclusion or entry zones.
+   * @param zoneLabels - Map of zone IDs to custom labels (e.g., {"Zone 1": "Bed", "Zone 2": "Desk"})
+   * @param deviceId - Device ID for entity resolution (preferred)
+   * @param entityMappings - Discovered entity mappings (fallback)
+   * @param entityNamePrefix - Legacy entity name prefix (fallback)
+   */
+  async syncZoneLabelsToHomeAssistant(
+    zoneLabels: Record<string, string>,
+    deviceId?: string,
+    entityMappings?: EntityMappings,
+    entityNamePrefix?: string
+  ): Promise<ZoneWriteResult> {
+    const tasks: ZoneWriteTask[] = [];
+
+    logger.debug({ deviceId, labelCount: Object.keys(zoneLabels).length }, 'Syncing zone labels to Home Assistant');
+
+    // Helper to get zone occupancy entity ID
+    const getZoneOccupancyEntity = (zoneNum: number): string | null => {
+      // Try device-level mapping first
+      if (deviceId) {
+        const mapping = deviceEntityService.getMapping(deviceId);
+        if (mapping) {
+          // For regular zones: zone1Occupancy, zone2Occupancy, etc.
+          const key = `zone${zoneNum}Occupancy`;
+          const entityId = mapping.mappings[key];
+          if (entityId) return entityId;
+        }
+      }
+
+      // Fallback to entity mappings
+      if (entityMappings) {
+        const key = `zone${zoneNum}Occupancy`;
+        const entityId = typeof (entityMappings as Record<string, unknown>)[key] === 'string' 
+          ? (entityMappings as Record<string, string>)[key]
+          : undefined;
+        if (entityId) return entityId;
+      }
+
+      // Last resort: construct from template (may not work for all devices)
+      if (entityNamePrefix) {
+        // Try both _occupancy (Lite) and _presence (Pro) suffixes
+        // The actual entity might use either depending on the device
+        return `binary_sensor.${entityNamePrefix}_zone_${zoneNum}_occupancy`;
+      }
+
+      return null;
+    };
+
+    // Process each zone label - only handle regular zones
+    for (const [zoneId, label] of Object.entries(zoneLabels)) {
+      const trimmedLabel = label?.trim();
+      if (!trimmedLabel) continue; // Skip empty labels
+
+      // Parse zone ID - only process regular zones (Zone 1, Zone 2, etc.)
+      // Exclusion and entry zones don't have occupancy sensors
+      const match = zoneId.match(/^Zone\s+(\d+)$/);
+      if (!match) {
+        logger.debug({ zoneId }, 'Skipping non-regular zone (exclusion/entry zones have no occupancy sensors)');
+        continue;
+      }
+
+      const zoneNum = parseInt(match[1], 10);
+
+      const entityId = getZoneOccupancyEntity(zoneNum);
+      if (!entityId) {
+        logger.debug({ zoneId, zoneNum }, 'Zone occupancy entity not found, skipping');
+        continue;
+      }
+
+      // Update the entity registry with the new friendly name (trimmed)
+      tasks.push({
+        execute: () => this.writeClient.updateEntityRegistry(entityId, { name: trimmedLabel }),
+        description: `Update friendly name for ${zoneId}`,
+        entityId,
+      });
+    }
+
+    if (tasks.length === 0) {
+      logger.info('No zone labels to sync');
+      return { ok: true, failures: [] };
+    }
+
+    logger.info({ taskCount: tasks.length }, 'Executing zone label sync to Home Assistant');
+    const failures = await this.executeTasksSequentially(tasks, { delayMs: 100, maxRetries: 2 });
+    return { ok: failures.length === 0, failures };
+  }
 }
