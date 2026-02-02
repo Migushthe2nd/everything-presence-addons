@@ -481,7 +481,9 @@ export class ZoneWriter {
       // Fallback to entity mappings
       if (entityMappings) {
         const key = `zone${zoneNum}Occupancy`;
-        const entityId = (entityMappings as any)[key];
+        const entityId = typeof (entityMappings as Record<string, unknown>)[key] === 'string' 
+          ? (entityMappings as Record<string, string>)[key]
+          : undefined;
         if (entityId) return entityId;
       }
 
@@ -497,7 +499,8 @@ export class ZoneWriter {
 
     // Process each zone label - only handle regular zones
     for (const [zoneId, label] of Object.entries(zoneLabels)) {
-      if (!label || !label.trim()) continue; // Skip empty labels
+      const trimmedLabel = label?.trim();
+      if (!trimmedLabel) continue; // Skip empty labels
 
       // Parse zone ID - only process regular zones (Zone 1, Zone 2, etc.)
       // Exclusion and entry zones don't have occupancy sensors
@@ -515,9 +518,9 @@ export class ZoneWriter {
         continue;
       }
 
-      // Update the entity registry with the new friendly name
+      // Update the entity registry with the new friendly name (trimmed)
       tasks.push({
-        execute: () => this.writeClient.updateEntityRegistry(entityId, { name: label }),
+        execute: () => this.writeClient.updateEntityRegistry(entityId, { name: trimmedLabel }),
         description: `Update friendly name for ${zoneId}`,
         entityId,
       });
