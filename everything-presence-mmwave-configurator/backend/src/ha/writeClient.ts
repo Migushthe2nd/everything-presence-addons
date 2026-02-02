@@ -41,6 +41,11 @@ export interface IHaWriteClient {
    * Set a text entity value
    */
   setTextEntity(entityId: string, value: string): Promise<void>;
+
+  /**
+   * Update entity registry entry (e.g., friendly name)
+   */
+  updateEntityRegistry(entityId: string, updates: { name?: string | null; [key: string]: unknown }): Promise<void>;
 }
 
 export class HaWriteClient implements IHaWriteClient {
@@ -142,5 +147,26 @@ export class HaWriteClient implements IHaWriteClient {
       entity_id: entityId,
       value,
     });
+  }
+
+  async updateEntityRegistry(entityId: string, updates: { name?: string | null; [key: string]: unknown }): Promise<void> {
+    const url = this.buildUrl(`/config/entity_registry/${entityId}`);
+
+    logger.debug({ entityId, updates }, 'Updating entity registry entry');
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: this.headers,
+      body: JSON.stringify(updates),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      const error = `HA entity registry update failed: ${res.status} ${res.statusText} - ${text}`;
+      logger.error({ entityId, status: res.status, error: text }, 'Entity registry update failed');
+      throw new Error(error);
+    }
+
+    logger.debug({ entityId, updates }, 'Entity registry entry updated successfully');
   }
 }

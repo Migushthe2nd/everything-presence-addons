@@ -7,10 +7,13 @@ import type { IHaReadTransport, DeviceRegistryEntry } from '../ha/readTransport'
 import type { EntityRegistryEntry } from '../ha/types';
 import { normalizeMappingKeys } from '../domain/mappingUtils';
 import type { DeviceProfileLoader } from '../domain/deviceProfiles';
+import type { IHaWriteClient } from '../ha/writeClient';
+import { ZoneWriter } from '../ha/zoneWriter';
 
 export interface DeviceMappingsRouterDependencies {
   readTransport?: IHaReadTransport;
   profileLoader?: DeviceProfileLoader;
+  writeClient?: IHaWriteClient;
 }
 
 /**
@@ -21,6 +24,7 @@ export const createDeviceMappingsRouter = (deps?: DeviceMappingsRouterDependenci
   const router = Router();
   const readTransport = deps?.readTransport;
   const profileLoader = deps?.profileLoader;
+  const writeClient = deps?.writeClient;
 
   /**
    * GET /api/device-mappings
@@ -535,7 +539,43 @@ export const createDeviceMappingsRouter = (deps?: DeviceMappingsRouterDependenci
 
       logger.info({ deviceId, labelCount: Object.keys(cleanedLabels).length }, 'Zone labels updated');
 
-      return res.json({ zoneLabels: cleanedLabels });
+      // Sync zone labels to Home Assistant entity registry if writeClient is available
+      if (writeClient && Object.keys(cleanedLabels).length > 0) {
+        try {
+          const zoneWriter = new ZoneWriter(writeClient);
+          const syncResult = await zoneWriter.syncZoneLabelsToHomeAssistant(
+            cleanedLabels,
+            deviceId
+          );
+
+          if (!syncResult.ok) {
+            logger.warn(
+              { deviceId, failures: syncResult.failures },
+              'Some zone labels failed to sync to Home Assistant'
+            );
+            // Return a partial success response
+            return res.json({
+              zoneLabels: cleanedLabels,
+              syncStatus: 'partial',
+              syncFailures: syncResult.failures,
+              message: 'Zone labels saved but some failed to sync to Home Assistant entity names',
+            });
+          }
+
+          logger.info({ deviceId }, 'Zone labels synced to Home Assistant successfully');
+        } catch (syncError) {
+          logger.error({ syncError, deviceId }, 'Failed to sync zone labels to Home Assistant');
+          // Still return success for saving, but note the sync failure
+          return res.json({
+            zoneLabels: cleanedLabels,
+            syncStatus: 'failed',
+            message: 'Zone labels saved but failed to sync to Home Assistant entity names',
+            syncError: syncError instanceof Error ? syncError.message : String(syncError),
+          });
+        }
+      }
+
+      return res.json({ zoneLabels: cleanedLabels, syncStatus: writeClient ? 'success' : 'skipped' });
     } catch (error) {
       logger.error({ error, deviceId }, 'Failed to update zone labels');
       return res.status(500).json({ message: 'Failed to update zone labels' });

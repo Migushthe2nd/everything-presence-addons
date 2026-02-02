@@ -1,0 +1,460 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ZoneWriter = void 0;
+const polygonUtils_1 = require("../domain/polygonUtils");
+const entityResolver_1 = require("../domain/entityResolver");
+const deviceEntityService_1 = require("../domain/deviceEntityService");
+const logger_1 = require("../logger");
+class ZoneWriter {
+    constructor(writeClient) {
+        this.writeClient = writeClient;
+    }
+    /**
+     * Execute tasks sequentially with retry logic and delays.
+     * This helps with opening too many requests to HA all at once
+     */
+    async executeTasksSequentially(tasks, options = {}) {
+        const { delayMs = 50, maxRetries = 2, continueOnError = true } = options;
+        const failures = [];
+        for (const task of tasks) {
+            let lastError = null;
+            for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                try {
+                    await task.execute();
+                    lastError = null;
+                    break;
+                }
+                catch (err) {
+                    lastError = err instanceof Error ? err : new Error(String(err));
+                    if (attempt < maxRetries) {
+                        logger_1.logger.warn({ description: task.description, attempt: attempt + 1, maxRetries }, 'Task failed, retrying...');
+                        // Exponential backoff: 100ms, 200ms, 400ms...
+                        await new Promise(resolve => setTimeout(resolve, 100 * Math.pow(2, attempt)));
+                    }
+                }
+            }
+            if (lastError) {
+                logger_1.logger.error({ description: task.description, error: lastError.message }, 'Task failed after retries');
+                failures.push({
+                    entityId: task.entityId,
+                    description: task.description,
+                    error: lastError.message,
+                });
+                if (!continueOnError) {
+                    throw lastError;
+                }
+            }
+            // Small delay between successful tasks to prevent overwhelming the device
+            if (delayMs > 0) {
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+        }
+        return failures;
+    }
+    /**
+     * Extract zone index from zone ID (e.g., "Zone 3" -> 3, "Entry 1" -> 1)
+     */
+    extractZoneIndex(id) {
+        const match = id.match(/\d+$/);
+        return match ? parseInt(match[0], 10) : 0;
+    }
+    /**
+     * Write polygon zones to device text entities.
+     * @param entityMap - Profile entity template map
+     * @param zones - Zones to write
+     * @param entityNamePrefix - Legacy entity name prefix (for fallback)
+     * @param entityMappings - Discovered entity mappings (preferred, optional)
+     * @param deviceId - Device ID for device-level mapping lookup (preferred, optional)
+     */
+    async applyPolygonZones(entityMap, zones, entityNamePrefix, entityMappings, deviceId) {
+        const tasks = [];
+        logger_1.logger.debug({ entityNamePrefix, deviceId, zoneCount: zones.length, hasMappings: !!entityMappings }, 'Applying polygon zones');
+        const regularZones = zones.filter(z => z.type === 'regular');
+        const exclusionZones = zones.filter(z => z.type === 'exclusion');
+        const entryZones = zones.filter(z => z.type === 'entry');
+        // Helper to resolve polygon entity
+        const resolvePolygon = (type, index, groupKey, key, template) => {
+            if (deviceId) {
+                const entityId = deviceEntityService_1.deviceEntityService.getPolygonZoneEntity(deviceId, type, index);
+                if (entityId)
+                    return entityId;
+            }
+            return entityResolver_1.EntityResolver.resolvePolygonZoneEntity(entityMappings, entityNamePrefix, groupKey, key, template);
+        };
+        // Regular polygon zones
+        if (entityMap.polygonZoneEntities || deviceId) {
+            const polyMap = entityMap.polygonZoneEntities || {};
+            regularZones.forEach((zone, idx) => {
+                const key = `zone${idx + 1}`;
+                const entityId = resolvePolygon('polygon', idx + 1, 'polygonZoneEntities', key, polyMap[key]);
+                if (entityId) {
+                    const textValue = (0, polygonUtils_1.polygonToText)(zone.vertices);
+                    logger_1.logger.debug({ entityId, vertices: zone.vertices.length }, 'Setting polygon zone');
+                    tasks.push({
+                        execute: () => this.writeClient.setTextEntity(entityId, textValue),
+                        description: `polygon zone ${idx + 1}`,
+                        entityId,
+                    });
+                }
+            });
+            // Clear unused slots
+            const maxZones = Math.max(Object.keys(polyMap).length, 4);
+            for (let i = regularZones.length; i < maxZones; i++) {
+                const key = `zone${i + 1}`;
+                const entityId = resolvePolygon('polygon', i + 1, 'polygonZoneEntities', key, polyMap[key]);
+                if (entityId) {
+                    tasks.push({
+                        execute: () => this.writeClient.setTextEntity(entityId, ''),
+                        description: `clear polygon zone ${i + 1}`,
+                        entityId,
+                    });
+                }
+            }
+        }
+        // Exclusion polygon zones
+        if (entityMap.polygonExclusionEntities || deviceId) {
+            const polyMap = entityMap.polygonExclusionEntities || {};
+            exclusionZones.forEach((zone, idx) => {
+                const key = `exclusion${idx + 1}`;
+                const entityId = resolvePolygon('polygonExclusion', idx + 1, 'polygonExclusionEntities', key, polyMap[key]);
+                if (entityId) {
+                    const textValue = (0, polygonUtils_1.polygonToText)(zone.vertices);
+                    logger_1.logger.debug({ entityId, vertices: zone.vertices.length }, 'Setting exclusion polygon');
+                    tasks.push({
+                        execute: () => this.writeClient.setTextEntity(entityId, textValue),
+                        description: `exclusion polygon ${idx + 1}`,
+                        entityId,
+                    });
+                }
+            });
+            const maxExclusions = Math.max(Object.keys(polyMap).length, 2);
+            for (let i = exclusionZones.length; i < maxExclusions; i++) {
+                const key = `exclusion${i + 1}`;
+                const entityId = resolvePolygon('polygonExclusion', i + 1, 'polygonExclusionEntities', key, polyMap[key]);
+                if (entityId) {
+                    tasks.push({
+                        execute: () => this.writeClient.setTextEntity(entityId, ''),
+                        description: `clear exclusion polygon ${i + 1}`,
+                        entityId,
+                    });
+                }
+            }
+        }
+        // Entry polygon zones
+        if (entityMap.polygonEntryEntities || deviceId) {
+            const polyMap = entityMap.polygonEntryEntities || {};
+            entryZones.forEach((zone, idx) => {
+                const key = `entry${idx + 1}`;
+                const entityId = resolvePolygon('polygonEntry', idx + 1, 'polygonEntryEntities', key, polyMap[key]);
+                if (entityId) {
+                    const textValue = (0, polygonUtils_1.polygonToText)(zone.vertices);
+                    logger_1.logger.debug({ entityId, vertices: zone.vertices.length }, 'Setting entry polygon');
+                    tasks.push({
+                        execute: () => this.writeClient.setTextEntity(entityId, textValue),
+                        description: `entry polygon ${idx + 1}`,
+                        entityId,
+                    });
+                }
+            });
+            const maxEntries = Math.max(Object.keys(polyMap).length, 2);
+            for (let i = entryZones.length; i < maxEntries; i++) {
+                const key = `entry${i + 1}`;
+                const entityId = resolvePolygon('polygonEntry', i + 1, 'polygonEntryEntities', key, polyMap[key]);
+                if (entityId) {
+                    tasks.push({
+                        execute: () => this.writeClient.setTextEntity(entityId, ''),
+                        description: `clear entry polygon ${i + 1}`,
+                        entityId,
+                    });
+                }
+            }
+        }
+        logger_1.logger.info({ taskCount: tasks.length }, 'Executing polygon zone updates sequentially');
+        const failures = await this.executeTasksSequentially(tasks);
+        return { ok: failures.length === 0, failures };
+    }
+    /**
+     * Toggle polygon zone mode on the device.
+     * @param entityMap - Profile entity template map
+     * @param entityNamePrefix - Legacy entity name prefix (for fallback)
+     * @param enabled - Whether to enable or disable polygon mode
+     * @param entityMappings - Discovered entity mappings (preferred, optional)
+     * @param deviceId - Device ID for device-level mapping lookup (preferred, optional)
+     */
+    async setPolygonMode(entityMap, entityNamePrefix, enabled, entityMappings, deviceId) {
+        const entityTemplate = entityMap?.polygonZonesEnabledEntity;
+        if (!entityTemplate && !entityMappings?.polygonZonesEnabledEntity && !deviceId) {
+            logger_1.logger.debug('No polygon mode entity configured');
+            return;
+        }
+        // Try device-level mapping first
+        let entityId = null;
+        if (deviceId) {
+            entityId = deviceEntityService_1.deviceEntityService.getEntityId(deviceId, 'polygonZonesEnabled');
+        }
+        if (!entityId) {
+            entityId = entityResolver_1.EntityResolver.resolve(entityMappings, entityNamePrefix, 'polygonZonesEnabledEntity', entityTemplate);
+        }
+        if (!entityId) {
+            logger_1.logger.debug('Could not resolve polygon mode entity');
+            return;
+        }
+        logger_1.logger.info({ entityId, enabled, usedDeviceMapping: !!deviceId }, 'Setting polygon mode');
+        await this.writeClient.setSwitchEntity(entityId, enabled);
+    }
+    /**
+     * Write rectangular zones to device number entities.
+     * Zones are matched by their ID (e.g., "Zone 3" writes to zone3 entities).
+     * Unused zone slots are cleared by setting coordinates to 0.
+     * @param zoneMap - Profile entity template map
+     * @param zones - Zones to write
+     * @param entityNamePrefix - Legacy entity name prefix (for fallback)
+     * @param entityMappings - Discovered entity mappings (preferred, optional)
+     * @param deviceId - Device ID for device-level mapping lookup (preferred, optional)
+     */
+    async applyZones(zoneMap, zones, entityNamePrefix, entityMappings, deviceId) {
+        const tasks = [];
+        logger_1.logger.debug({ entityNamePrefix, deviceId, zoneCount: zones.length, hasMappings: !!entityMappings }, 'Applying rectangular zones');
+        const regularZones = zones.filter(z => z.type === 'regular');
+        const exclusionZones = zones.filter(z => z.type === 'exclusion');
+        const entryZones = zones.filter(z => z.type === 'entry');
+        // Helper to resolve zone entity set
+        const resolveZone = (type, index, groupKey, key, mapping) => {
+            if (deviceId) {
+                const zoneSet = deviceEntityService_1.deviceEntityService.getZoneEntitySet(deviceId, type, index);
+                if (zoneSet)
+                    return zoneSet;
+            }
+            return entityResolver_1.EntityResolver.resolveZoneEntitySet(entityMappings, entityNamePrefix, groupKey, key, mapping);
+        };
+        // Regular zones - write active zones and clear unused slots
+        if (zoneMap.zoneConfigEntities || deviceId) {
+            const regularMap = zoneMap.zoneConfigEntities || {};
+            const maxZones = Math.max(Object.keys(regularMap).length, 4);
+            for (let i = 1; i <= maxZones; i++) {
+                const key = `zone${i}`;
+                const mapping = regularMap[key];
+                if (!mapping && !deviceId)
+                    continue;
+                const zoneEntitySet = resolveZone('regular', i, 'zoneConfigEntities', key, mapping);
+                if (!zoneEntitySet)
+                    continue;
+                // Find zone by its ID index (e.g., "Zone 3" matches slot 3)
+                const zone = regularZones.find(z => this.extractZoneIndex(z.id) === i);
+                const updates = [];
+                if (zone) {
+                    if (zoneEntitySet.beginX)
+                        updates.push({ entity: zoneEntitySet.beginX, value: zone.x });
+                    if (zoneEntitySet.endX)
+                        updates.push({ entity: zoneEntitySet.endX, value: zone.x + zone.width });
+                    if (zoneEntitySet.beginY)
+                        updates.push({ entity: zoneEntitySet.beginY, value: zone.y });
+                    if (zoneEntitySet.endY)
+                        updates.push({ entity: zoneEntitySet.endY, value: zone.y + zone.height });
+                    if (zoneEntitySet.offDelay)
+                        updates.push({ entity: zoneEntitySet.offDelay, value: 15 });
+                }
+                else {
+                    // Clear unused zone slot by setting all coordinates to 0
+                    if (zoneEntitySet.beginX)
+                        updates.push({ entity: zoneEntitySet.beginX, value: 0 });
+                    if (zoneEntitySet.endX)
+                        updates.push({ entity: zoneEntitySet.endX, value: 0 });
+                    if (zoneEntitySet.beginY)
+                        updates.push({ entity: zoneEntitySet.beginY, value: 0 });
+                    if (zoneEntitySet.endY)
+                        updates.push({ entity: zoneEntitySet.endY, value: 0 });
+                }
+                updates.forEach(({ entity, value }) => {
+                    tasks.push({
+                        execute: () => this.writeClient.setNumberEntity(entity, value),
+                        description: `regular zone ${i} ${entity}`,
+                        entityId: entity,
+                    });
+                });
+            }
+        }
+        // Exclusion zones - write active zones and clear unused slots
+        if (zoneMap.exclusionZoneConfigEntities || deviceId) {
+            const exclusionMap = zoneMap.exclusionZoneConfigEntities || {};
+            const maxExclusions = Math.max(Object.keys(exclusionMap).length, 2);
+            for (let i = 1; i <= maxExclusions; i++) {
+                const key = `exclusion${i}`;
+                const mapping = exclusionMap[key];
+                if (!mapping && !deviceId)
+                    continue;
+                const zoneEntitySet = resolveZone('exclusion', i, 'exclusionZoneConfigEntities', key, mapping);
+                if (!zoneEntitySet)
+                    continue;
+                // Find zone by its ID index
+                const zone = exclusionZones.find(z => this.extractZoneIndex(z.id) === i);
+                const updates = [];
+                if (zone) {
+                    if (zoneEntitySet.beginX)
+                        updates.push({ entity: zoneEntitySet.beginX, value: zone.x });
+                    if (zoneEntitySet.endX)
+                        updates.push({ entity: zoneEntitySet.endX, value: zone.x + zone.width });
+                    if (zoneEntitySet.beginY)
+                        updates.push({ entity: zoneEntitySet.beginY, value: zone.y });
+                    if (zoneEntitySet.endY)
+                        updates.push({ entity: zoneEntitySet.endY, value: zone.y + zone.height });
+                }
+                else {
+                    // Clear unused exclusion zone slot
+                    if (zoneEntitySet.beginX)
+                        updates.push({ entity: zoneEntitySet.beginX, value: 0 });
+                    if (zoneEntitySet.endX)
+                        updates.push({ entity: zoneEntitySet.endX, value: 0 });
+                    if (zoneEntitySet.beginY)
+                        updates.push({ entity: zoneEntitySet.beginY, value: 0 });
+                    if (zoneEntitySet.endY)
+                        updates.push({ entity: zoneEntitySet.endY, value: 0 });
+                }
+                updates.forEach(({ entity, value }) => {
+                    tasks.push({
+                        execute: () => this.writeClient.setNumberEntity(entity, value),
+                        description: `exclusion zone ${i} ${entity}`,
+                        entityId: entity,
+                    });
+                });
+            }
+        }
+        // Entry zones - write active zones and clear unused slots
+        if (zoneMap.entryZoneConfigEntities || deviceId) {
+            const entryMap = zoneMap.entryZoneConfigEntities || {};
+            const maxEntries = Math.max(Object.keys(entryMap).length, 2);
+            for (let i = 1; i <= maxEntries; i++) {
+                const key = `entry${i}`;
+                const mapping = entryMap[key];
+                if (!mapping && !deviceId)
+                    continue;
+                const zoneEntitySet = resolveZone('entry', i, 'entryZoneConfigEntities', key, mapping);
+                if (!zoneEntitySet)
+                    continue;
+                // Find zone by its ID index
+                const zone = entryZones.find(z => this.extractZoneIndex(z.id) === i);
+                const updates = [];
+                if (zone) {
+                    if (zoneEntitySet.beginX)
+                        updates.push({ entity: zoneEntitySet.beginX, value: zone.x });
+                    if (zoneEntitySet.endX)
+                        updates.push({ entity: zoneEntitySet.endX, value: zone.x + zone.width });
+                    if (zoneEntitySet.beginY)
+                        updates.push({ entity: zoneEntitySet.beginY, value: zone.y });
+                    if (zoneEntitySet.endY)
+                        updates.push({ entity: zoneEntitySet.endY, value: zone.y + zone.height });
+                }
+                else {
+                    // Clear unused entry zone slot
+                    if (zoneEntitySet.beginX)
+                        updates.push({ entity: zoneEntitySet.beginX, value: 0 });
+                    if (zoneEntitySet.endX)
+                        updates.push({ entity: zoneEntitySet.endX, value: 0 });
+                    if (zoneEntitySet.beginY)
+                        updates.push({ entity: zoneEntitySet.beginY, value: 0 });
+                    if (zoneEntitySet.endY)
+                        updates.push({ entity: zoneEntitySet.endY, value: 0 });
+                }
+                updates.forEach(({ entity, value }) => {
+                    tasks.push({
+                        execute: () => this.writeClient.setNumberEntity(entity, value),
+                        description: `entry zone ${i} ${entity}`,
+                        entityId: entity,
+                    });
+                });
+            }
+        }
+        logger_1.logger.info({ taskCount: tasks.length }, 'Executing zone updates');
+        const results = await Promise.allSettled(tasks.map((task) => task.execute()));
+        const failures = [];
+        results.forEach((result, idx) => {
+            if (result.status === 'rejected') {
+                const error = result.reason instanceof Error ? result.reason.message : String(result.reason);
+                failures.push({
+                    entityId: tasks[idx].entityId,
+                    description: tasks[idx].description,
+                    error,
+                });
+            }
+        });
+        return { ok: failures.length === 0, failures };
+    }
+    /**
+     * Sync zone labels to Home Assistant entity registry friendly names.
+     * Updates the friendly names of zone occupancy/presence binary sensors.
+     * @param zoneLabels - Map of zone IDs to custom labels (e.g., {"Zone 1": "Bed", "Zone 2": "Desk"})
+     * @param deviceId - Device ID for entity resolution (preferred)
+     * @param entityMappings - Discovered entity mappings (fallback)
+     * @param entityNamePrefix - Legacy entity name prefix (fallback)
+     */
+    async syncZoneLabelsToHomeAssistant(zoneLabels, deviceId, entityMappings, entityNamePrefix) {
+        const tasks = [];
+        logger_1.logger.debug({ deviceId, labelCount: Object.keys(zoneLabels).length }, 'Syncing zone labels to Home Assistant');
+        // Helper to get zone occupancy entity ID
+        const getZoneOccupancyEntity = (zoneType, zoneNum) => {
+            // Try device-level mapping first
+            if (deviceId) {
+                const mapping = deviceEntityService_1.deviceEntityService.getMapping(deviceId);
+                if (mapping) {
+                    // For regular zones: zone1Occupancy, zone2Occupancy, etc.
+                    // For exclusion zones: exclusion1Occupancy, exclusion2Occupancy, etc.
+                    // For entry zones: entry1Occupancy, entry2Occupancy, etc.
+                    const key = zoneType === 'Zone'
+                        ? `zone${zoneNum}Occupancy`
+                        : `${zoneType.toLowerCase()}${zoneNum}Occupancy`;
+                    const entityId = mapping.mappings[key];
+                    if (entityId)
+                        return entityId;
+                }
+            }
+            // Fallback to entity mappings or template resolution
+            if (entityMappings) {
+                // Zone occupancy sensors are flat in entity mappings (not nested like config entities)
+                const key = zoneType === 'Zone'
+                    ? `zone${zoneNum}Occupancy`
+                    : `${zoneType.toLowerCase()}${zoneNum}Occupancy`;
+                const entityId = entityMappings[key];
+                if (entityId)
+                    return entityId;
+            }
+            // Last resort: construct from template
+            if (entityNamePrefix) {
+                const zoneName = zoneType === 'Zone' ? `zone_${zoneNum}` : `${zoneType.toLowerCase()}_${zoneNum}`;
+                return `binary_sensor.${entityNamePrefix}_${zoneName}_occupancy`;
+            }
+            return null;
+        };
+        // Process each zone label
+        for (const [zoneId, label] of Object.entries(zoneLabels)) {
+            if (!label || !label.trim())
+                continue; // Skip empty labels
+            // Parse zone ID (e.g., "Zone 1", "Exclusion 2", "Entry 1")
+            const match = zoneId.match(/^(Zone|Exclusion|Entry)\s+(\d+)$/);
+            if (!match) {
+                logger_1.logger.warn({ zoneId }, 'Invalid zone ID format, skipping');
+                continue;
+            }
+            const [, zoneType, zoneNumStr] = match;
+            const zoneNum = parseInt(zoneNumStr, 10);
+            const entityId = getZoneOccupancyEntity(zoneType, zoneNum);
+            if (!entityId) {
+                logger_1.logger.debug({ zoneId, zoneType, zoneNum }, 'Zone occupancy entity not found, skipping');
+                continue;
+            }
+            // Update the entity registry with the new friendly name
+            tasks.push({
+                execute: () => this.writeClient.updateEntityRegistry(entityId, { name: label }),
+                description: `Update friendly name for ${zoneId}`,
+                entityId,
+            });
+        }
+        if (tasks.length === 0) {
+            logger_1.logger.info('No zone labels to sync');
+            return { ok: true, failures: [] };
+        }
+        logger_1.logger.info({ taskCount: tasks.length }, 'Executing zone label sync to Home Assistant');
+        const failures = await this.executeTasksSequentially(tasks, { delayMs: 100, maxRetries: 2 });
+        return { ok: failures.length === 0, failures };
+    }
+}
+exports.ZoneWriter = ZoneWriter;
