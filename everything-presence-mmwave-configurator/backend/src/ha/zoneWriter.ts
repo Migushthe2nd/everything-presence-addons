@@ -449,6 +449,7 @@ export class ZoneWriter {
   /**
    * Sync zone labels to Home Assistant entity registry friendly names.
    * Updates the friendly names of zone occupancy/presence binary sensors.
+   * Only syncs regular zones (Zone 1-4), not exclusion or entry zones.
    * @param zoneLabels - Map of zone IDs to custom labels (e.g., {"Zone 1": "Bed", "Zone 2": "Desk"})
    * @param deviceId - Device ID for entity resolution (preferred)
    * @param entityMappings - Discovered entity mappings (fallback)
@@ -465,58 +466,52 @@ export class ZoneWriter {
     logger.debug({ deviceId, labelCount: Object.keys(zoneLabels).length }, 'Syncing zone labels to Home Assistant');
 
     // Helper to get zone occupancy entity ID
-    const getZoneOccupancyEntity = (zoneType: string, zoneNum: number): string | null => {
+    const getZoneOccupancyEntity = (zoneNum: number): string | null => {
       // Try device-level mapping first
       if (deviceId) {
         const mapping = deviceEntityService.getMapping(deviceId);
         if (mapping) {
           // For regular zones: zone1Occupancy, zone2Occupancy, etc.
-          // For exclusion zones: exclusion1Occupancy, exclusion2Occupancy, etc.
-          // For entry zones: entry1Occupancy, entry2Occupancy, etc.
-          const key = zoneType === 'Zone' 
-            ? `zone${zoneNum}Occupancy`
-            : `${zoneType.toLowerCase()}${zoneNum}Occupancy`;
+          const key = `zone${zoneNum}Occupancy`;
           const entityId = mapping.mappings[key];
           if (entityId) return entityId;
         }
       }
 
-      // Fallback to entity mappings or template resolution
+      // Fallback to entity mappings
       if (entityMappings) {
-        // Zone occupancy sensors are flat in entity mappings (not nested like config entities)
-        const key = zoneType === 'Zone'
-          ? `zone${zoneNum}Occupancy`
-          : `${zoneType.toLowerCase()}${zoneNum}Occupancy`;
+        const key = `zone${zoneNum}Occupancy`;
         const entityId = (entityMappings as any)[key];
         if (entityId) return entityId;
       }
 
-      // Last resort: construct from template
+      // Last resort: construct from template (may not work for all devices)
       if (entityNamePrefix) {
-        const zoneName = zoneType === 'Zone' ? `zone_${zoneNum}` : `${zoneType.toLowerCase()}_${zoneNum}`;
-        return `binary_sensor.${entityNamePrefix}_${zoneName}_occupancy`;
+        // Try both _occupancy (Lite) and _presence (Pro) suffixes
+        // The actual entity might use either depending on the device
+        return `binary_sensor.${entityNamePrefix}_zone_${zoneNum}_occupancy`;
       }
 
       return null;
     };
 
-    // Process each zone label
+    // Process each zone label - only handle regular zones
     for (const [zoneId, label] of Object.entries(zoneLabels)) {
       if (!label || !label.trim()) continue; // Skip empty labels
 
-      // Parse zone ID (e.g., "Zone 1", "Exclusion 2", "Entry 1")
-      const match = zoneId.match(/^(Zone|Exclusion|Entry)\s+(\d+)$/);
+      // Parse zone ID - only process regular zones (Zone 1, Zone 2, etc.)
+      // Exclusion and entry zones don't have occupancy sensors
+      const match = zoneId.match(/^Zone\s+(\d+)$/);
       if (!match) {
-        logger.warn({ zoneId }, 'Invalid zone ID format, skipping');
+        logger.debug({ zoneId }, 'Skipping non-regular zone (exclusion/entry zones have no occupancy sensors)');
         continue;
       }
 
-      const [, zoneType, zoneNumStr] = match;
-      const zoneNum = parseInt(zoneNumStr, 10);
+      const zoneNum = parseInt(match[1], 10);
 
-      const entityId = getZoneOccupancyEntity(zoneType, zoneNum);
+      const entityId = getZoneOccupancyEntity(zoneNum);
       if (!entityId) {
-        logger.debug({ zoneId, zoneType, zoneNum }, 'Zone occupancy entity not found, skipping');
+        logger.debug({ zoneId, zoneNum }, 'Zone occupancy entity not found, skipping');
         continue;
       }
 
